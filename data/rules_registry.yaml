@@ -1,0 +1,26 @@
+rules:
+  - id: rule_001
+    name: backup_file_detection
+    type: regex
+    # Matches filenames like: Note Title_backup_20251030_110939.md
+    pattern: "_backup_\\d{8}_\\d{6}\\.md$"
+    action: flag_as_duplicate
+    target_folder: "Archive/Backups"
+    confidence: 0.99
+    hit_count: 0
+    created: 2026-06-02
+    created_by: seed
+    description: "Files ending in _backup_YYYYMMDD_HHMMSS.md are redundant backups"
+
+  - id: rule_002
+    name: daily_note_at_root
+    type: regex
+    # Matches filenames like: Daily - 06-02-2026.md
+    pattern: "^Daily - \\d{2}-\\d{2}-\\d{4}\\.md$"
+    action: move_to_folder
+    target_folder: "Daily Notes"
+    confidence: 0.99
+    hit_count: 0
+    created: 2026-06-02
+    created_by: seed
+    description: "Loose daily notes at vault root should be consolidated into Daily Notes/"

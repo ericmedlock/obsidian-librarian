@@ -1,0 +1,154 @@
+scan_vault:
+  description: >
+    Audit the Obsidian vault at {vault_path}.
+
+    Step 1 — Run the rules registry ({rules_registry_path}) against every file.
+    Record each rule match: file path, rule id, prescribed action.
+
+    Step 2 — For files with no rule match, reason about each file:
+    - Is it in the correct folder given its content?
+    - Does its filename follow the conventions observed in this vault?
+    - Does it have frontmatter? Is frontmatter complete?
+    - Does it have any incoming or outgoing wikilinks? If neither, it is an orphan.
+    - Is it a duplicate or backup of another note?
+    - Has it been untouched for more than {stale_threshold_days} days?
+
+    Step 3 — Produce a structured anomaly list. Each item must include:
+    file_path, anomaly_type (misplaced | missing_frontmatter | orphan | duplicate |
+    stale | naming_violation), severity (high | medium | low), and recommended_action.
+
+    Do not modify any files.
+  expected_output: >
+    A structured JSON-compatible list of anomalies with fields: file_path,
+    anomaly_type, severity, recommended_action, and rule_id (null if LLM-reasoned).
+    Also include a summary: total files scanned, total rule hits, total LLM-reasoned
+    decisions, anomaly count by type.
+  agent: scanner
+
+classify_notes:
+  description: >
+    For each note in the anomaly list where anomaly_type includes 'missing_frontmatter',
+    read the note content at {vault_path} and determine:
+
+    1. tags — 1 to 5 tags. Check existing tags in the vault first. Only create a new
+       tag if no existing tag fits and the concept is significant enough to recur.
+    2. topic — single primary topic from the vault's existing topic taxonomy. If no
+       taxonomy exists yet, derive one from the dominant subject clusters in the vault.
+    3. note_type — one of: reference, fleeting, literature, permanent, daily, project, resource
+    4. status — one of: draft, active, archived
+    5. privacy_tier — integer 0-2. Apply tier 2 if note contains any of: therapy, medical,
+       diagnosis, medication, financial, legal, password, credential, SSN, or similar.
+       Apply tier 1 for personal but non-sensitive content. Default to 0.
+
+    Output the proposed frontmatter for each note as a YAML block. Do not write to files.
+  expected_output: >
+    A list of frontmatter proposals, one per note. Each entry: file_path and a complete
+    YAML frontmatter block ready to be prepended to the note. Also flag any notes where
+    privacy_tier was elevated to 2 with a brief explanation.
+  agent: classifier
+  context:
+    - scan_vault
+
+organize_vault:
+  description: >
+    Execute the structural changes prescribed by the scan and classification tasks.
+
+    For each anomaly with a recommended_action, and for each frontmatter proposal,
+    perform the following (or in dry_run mode, describe what you would do):
+
+    MOVES: Move misplaced files to their correct folder. Create the folder if it does
+    not exist. Preserve the filename unless a rename is also prescribed.
+
+    RENAMES: Rename files that violate naming conventions. Use title-case with hyphens
+    or spaces as found in the surrounding vault convention. Never rename daily notes.
+
+    FRONTMATTER: Write the proposed frontmatter to each note. If the note already has
+    frontmatter, merge — do not overwrite user-authored fields.
+
+    ARCHIVES: Move orphaned, stale notes to {vault_path}/Archive/ only if they have
+    no incoming links AND have not been modified in more than {stale_threshold_days} days.
+
+    DUPLICATES: Move backup files (matching _backup_ pattern) to {vault_path}/Archive/Backups/.
+    Do not delete anything.
+
+    Log every action to {run_log_path} as a JSONL line:
+    {"timestamp": "...", "file_path": "...", "action": "...", "rule_id": "...",
+     "agent": "organizer", "rationale": "..."}
+
+    dry_run={dry_run} — if true, produce the log as a preview only, write nothing to disk.
+  expected_output: >
+    A summary of all actions taken (or previewed in dry-run mode): count by action type,
+    list of moves, renames, frontmatter writes, and archives. Any action that could not
+    be completed must be listed with the reason.
+  agent: organizer
+  context:
+    - scan_vault
+    - classify_notes
+
+generate_rules:
+  description: >
+    Review the decisions made during this run that were resolved by LLM reasoning
+    (rule_id = null in the scan output and organize log).
+
+    For each LLM-reasoned decision, evaluate:
+    - Can this decision be expressed as a regex on the filename or path?
+    - Can it be expressed as a match on a frontmatter field?
+    - Can it be expressed as a simple Python condition on note content?
+    - Has a similar decision appeared in previous runs in {run_log_path}?
+
+    Write a new rule to {rules_registry_path} for any pattern where:
+    - It has occurred at least 3 times (across all runs), OR
+    - It is so obvious and universal that confidence >= 0.95 even on first occurrence
+    - Confidence must be >= {rule_confidence_threshold} to write the rule
+
+    Do not modify existing rules. Only append new ones.
+    Assign the next sequential rule ID.
+  expected_output: >
+    A list of new rules written (or "No new rules generated this run" if threshold
+    not met). For each rule: id, name, pattern, action, confidence, and plain-English
+    rationale for why this pattern is generalizable.
+  agent: rule_writer
+  context:
+    - scan_vault
+    - organize_vault
+
+write_report:
+  description: >
+    Write a vault health report as a Markdown note to:
+    {vault_path}/Obsidian Librarian/Reports/{report_date}.md
+
+    The report must be readable in under 60 seconds. Structure:
+
+    # Vault Health Report — {report_date}
+
+    ## Summary
+    One paragraph. What happened. What the vault looks like now.
+
+    ## Actions Taken
+    Table: Action Type | Count | Notes
+
+    ## New Rules Generated
+    For each new rule: name and one-line description. "None" if none.
+
+    ## Still Needs Attention
+    Items that could not be auto-resolved and require user decision.
+    Keep this list short and specific — no more than 10 items.
+
+    ## Vault Metrics
+    - Total notes: X
+    - Orphans remaining: X
+    - Untagged notes remaining: X
+    - Stale notes (>{stale_threshold_days} days): X
+    - Rules in registry: X
+    - Token-free rule hits this run: X / X total decisions (X%)
+
+    The last metric ("Token-free rule hits") is the most important long-term health
+    indicator — it shows the system getting smarter over time.
+  expected_output: >
+    Confirmation that the report was written to the correct path, plus the full
+    report content as a string.
+  agent: reporter
+  context:
+    - scan_vault
+    - organize_vault
+    - generate_rules

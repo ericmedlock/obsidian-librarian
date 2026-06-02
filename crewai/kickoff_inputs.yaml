@@ -1,0 +1,11 @@
+# crew.kickoff(inputs={...})
+# These are the runtime inputs interpolated into agent/task prompts.
+# Pass this dict when running: crew.kickoff(inputs=kickoff_inputs)
+
+vault_path: "/Users/ericmedlock/Documents/default obsidian vault"
+run_log_path: "~/.librarian/run_log.jsonl"
+rules_registry_path: "~/.librarian/rules_registry.yaml"
+report_date: "2026-06-02"          # set dynamically at runtime: datetime.today()
+dry_run: false                      # true = preview only, no writes
+stale_threshold_days: 90
+rule_confidence_threshold: 0.85
