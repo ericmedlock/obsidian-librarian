@@ -11,6 +11,17 @@ from librarian.config import Config
 
 
 class _DebounceHandler(FileSystemEventHandler):
+    """
+    Coalesces filesystem events per path and resolves them by existence.
+
+    Every create/modify/delete/move on a `.md` path (re)schedules a single
+    debounced "settle". When the timer fires we check whether the file still
+    exists: present → upsert, gone → delete. This is essential because editors
+    (including Obsidian) save atomically (write-temp + rename-over), which emits
+    a delete event for the real path; handling deletes eagerly would wipe the
+    index on every save instead of re-indexing.
+    """
+
     def __init__(
         self,
         on_upsert: Callable[[Path], None],
@@ -24,31 +35,41 @@ class _DebounceHandler(FileSystemEventHandler):
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
 
-    def _schedule(self, path: str, fn: Callable[[], None]) -> None:
+    def _settle(self, path: str) -> None:
+        with self._lock:
+            self._timers.pop(path, None)
+        p = Path(path)
+        if p.exists():
+            self._on_upsert(p)
+        else:
+            self._on_delete(p)
+
+    def _schedule(self, path: str) -> None:
+        if not path.endswith(".md"):
+            return
         with self._lock:
             if path in self._timers:
                 self._timers[path].cancel()
-            t = threading.Timer(self._debounce, fn)
+            t = threading.Timer(self._debounce, self._settle, args=(path,))
             self._timers[path] = t
             t.start()
 
     def on_created(self, event: FileSystemEvent) -> None:
-        if not event.is_directory and event.src_path.endswith(".md"):
-            p = Path(event.src_path)
-            self._schedule(event.src_path, lambda: self._on_upsert(p))
+        if not event.is_directory:
+            self._schedule(event.src_path)
 
     def on_modified(self, event: FileSystemEvent) -> None:
-        if not event.is_directory and event.src_path.endswith(".md"):
-            p = Path(event.src_path)
-            self._schedule(event.src_path, lambda: self._on_upsert(p))
+        if not event.is_directory:
+            self._schedule(event.src_path)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
-        if not event.is_directory and event.src_path.endswith(".md"):
-            with self._lock:
-                if event.src_path in self._timers:
-                    self._timers[event.src_path].cancel()
-                    del self._timers[event.src_path]
-            self._on_delete(Path(event.src_path))
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._schedule(event.src_path)  # old path: will resolve to delete
+            self._schedule(event.dest_path)  # new path: will resolve to upsert
 
 
 class VaultWatcher:

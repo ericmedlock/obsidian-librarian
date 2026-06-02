@@ -25,11 +25,11 @@ class Chunk:
     frontmatter: dict = field(default_factory=dict)
 
 
-def chunk_note(path: Path) -> tuple[dict, list[Chunk]]:
+def parse_note(path: Path) -> tuple[dict, str, list[Chunk]]:
     """
-    Parse a markdown note and return (frontmatter_dict, list_of_chunks).
+    Parse a markdown note once and return (frontmatter_dict, body, chunks).
     Splits on H2/H3 headings; falls back to sliding window for headingless notes.
-    Frontmatter is not included in any chunk.
+    Frontmatter is not included in any chunk's text.
     """
     raw = path.read_text(encoding="utf-8")
     post = frontmatter.loads(raw)
@@ -40,6 +40,18 @@ def chunk_note(path: Path) -> tuple[dict, list[Chunk]]:
     if not chunks:
         chunks = _sliding_window(body, str(path))
 
+    # Attach the note's frontmatter to every chunk so downstream stages
+    # (embedder metadata, graph) can read fields like privacy_tier without
+    # re-parsing the file.
+    for c in chunks:
+        c.frontmatter = fm
+
+    return fm, body, chunks
+
+
+def chunk_note(path: Path) -> tuple[dict, list[Chunk]]:
+    """Backwards-compatible wrapper: return (frontmatter_dict, chunks)."""
+    fm, _body, chunks = parse_note(path)
     return fm, chunks
 
 

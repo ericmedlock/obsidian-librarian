@@ -15,11 +15,16 @@ _CONFIG_PATH = Path("~/.librarian/config.yaml").expanduser()
 class Config(BaseSettings):
     vault_path: str = str(Path("~/Documents/default obsidian vault").expanduser())
     lm_studio_url: str = "http://localhost:1234/v1"
-    main_model: str = "qwen2.5-32b-instruct-q4_k_m"
-    embed_model: str = "nomic-embed-text-v1.5"
+    main_model: str = "qwen/qwen3.6-27b"
+    embed_model: str = "text-embedding-nomic-embed-text-v1.5"
 
     autonomous_mode: bool = True
     debounce_seconds: int = 5
+
+    # Privacy tier assigned to ingested notes that lack a frontmatter privacy_tier.
+    # 0=public, 1=personal, 2=sensitive, 3=private. Default to personal for a
+    # single-user vault; the Classifier agent elevates sensitive notes to tier 2.
+    default_privacy_tier: int = 1
     rule_confidence_threshold: float = 0.85
     rule_generation_batch_size: int = 25
     stale_threshold_days: int = 90

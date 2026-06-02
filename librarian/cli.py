@@ -7,13 +7,13 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.progress import track
 from rich.table import Table
 
 from librarian.config import ensure_librarian_dir, load_config
-from librarian.ingest.chunker import chunk_note
-from librarian.ingest.embedder import Embedder
+from librarian.pipeline import IngestPipeline, iter_vault_notes
+from librarian.rag.graph import VaultGraph
 from librarian.rag.store import VaultStore
-from librarian.rules.engine import FileEvent, RuleEngine
 from librarian.rules.loader import RulesRegistry
 
 app = typer.Typer(name="librarian", help="Obsidian Librarian — local AI vault organizer")
@@ -78,6 +78,9 @@ def status():
     cfg = _get_cfg()
     registry = _get_registry(cfg)
     store = VaultStore(cfg)
+    graph = VaultGraph(cfg)
+    gstats = graph.stats()
+    graph.close()
 
     console.print("[bold]Obsidian Librarian — Status[/]\n")
 
@@ -90,6 +93,9 @@ def status():
     table.add_row("Model", cfg.main_model)
     table.add_row("Autonomous mode", str(cfg.autonomous_mode))
     table.add_row("Chunks indexed", str(store.count()))
+    table.add_row("Notes in graph", str(gstats["total_notes"]))
+    table.add_row("Orphan notes", str(gstats["orphans"]))
+    table.add_row("Wikilinks", str(gstats["total_links"]))
     table.add_row("Rules loaded", str(len(registry.rules)))
 
     # Last run from run_log
@@ -109,25 +115,108 @@ def status():
 
 @app.command()
 def ingest(path: Path = typer.Argument(..., help="Path to a .md file to force-ingest")):
-    """Manually ingest a specific file into the vector store."""
+    """Manually ingest a specific file into the vector store + metadata graph."""
     cfg = _get_cfg()
     if not path.exists():
         console.print(f"[red]File not found:[/] {path}")
         raise typer.Exit(1)
 
     console.print(f"Ingesting [cyan]{path.name}[/]...")
+    pipeline = IngestPipeline(cfg)
+    n = pipeline.ingest_file(path)
+    pipeline.close()
+    console.print(f"[green]Done.[/] {n} chunks upserted.")
 
-    fm, chunks = chunk_note(path)
-    console.print(f"  Frontmatter keys: {list(fm.keys()) or 'none'}")
-    console.print(f"  Chunks: {len(chunks)}")
 
-    embedder = Embedder(cfg)
-    embedded = embedder.embed_chunks(chunks)
+@app.command()
+def scan(
+    limit: Optional[int] = typer.Option(None, help="Only ingest the first N notes (for testing)"),
+):
+    """Full vault scan: ingest every note into the vector store + metadata graph."""
+    cfg = _get_cfg()
+    notes = iter_vault_notes(cfg.vault_path)
+    if limit:
+        notes = notes[:limit]
 
-    store = VaultStore(cfg)
-    store.upsert(embedded)
+    console.print(f"Scanning [bold]{len(notes)}[/] notes from {cfg.vault_path}\n")
+    pipeline = IngestPipeline(cfg)
 
-    console.print(f"[green]Done.[/] {len(embedded)} chunks upserted.")
+    total_chunks = 0
+    failed: list[tuple[str, str]] = []
+    for note in track(notes, description="Ingesting", console=console):
+        try:
+            total_chunks += pipeline.ingest_file(note)
+        except Exception as exc:  # noqa: BLE001 — report and continue the scan
+            failed.append((note.name, str(exc)))
+
+    stats = pipeline.graph.stats()
+    pipeline.close()
+
+    console.print(
+        f"\n[green]Done.[/] {len(notes) - len(failed)} notes, "
+        f"{total_chunks} chunks indexed. "
+        f"Graph: {stats['total_notes']} notes, {stats['orphans']} orphans, "
+        f"{stats['total_links']} links."
+    )
+    if failed:
+        console.print(f"[yellow]{len(failed)} notes failed:[/]")
+        for name, err in failed[:10]:
+            console.print(f"  [red]{name}[/]: {err}")
+
+
+@app.command()
+def watch():
+    """Watch the vault and incrementally ingest changes until interrupted."""
+    import time
+
+    from librarian.ingest.watcher import VaultWatcher
+
+    cfg = _get_cfg()
+    registry = _get_registry(cfg)
+    pipeline = IngestPipeline(cfg, registry=registry)
+
+    def on_upsert(p: Path) -> None:
+        try:
+            match = pipeline.apply_rules(p)
+            n = pipeline.ingest_file(p)
+            tag = f" → rule {match.rule.id} ({match.action})" if match else ""
+            console.print(f"[green]+[/] {p.name}: {n} chunks{tag}")
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]![/] {p.name}: {exc}")
+
+    def on_delete(p: Path) -> None:
+        pipeline.delete_file(p)
+        console.print(f"[dim]-[/] {p.name}: removed from index")
+
+    watcher = VaultWatcher(cfg, on_upsert, on_delete)
+    watcher.start()
+    console.print(f"[bold]Watching[/] {cfg.vault_path} (Ctrl-C to stop)\n")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\nStopping...")
+    finally:
+        watcher.stop()
+        pipeline.close()
+
+
+@app.command()
+def orphans(limit: int = typer.Option(20, help="Max orphans to list")):
+    """List notes with no incoming or outgoing wikilinks (needs a prior scan)."""
+    cfg = _get_cfg()
+    graph = VaultGraph(cfg)
+    orphan_paths = graph.orphans()
+    stats = graph.stats()
+    graph.close()
+
+    console.print(
+        f"[bold]{len(orphan_paths)}[/] orphans of {stats['total_notes']} notes\n"
+    )
+    for p in orphan_paths[:limit]:
+        console.print(f"  {Path(p).name}")
+    if len(orphan_paths) > limit:
+        console.print(f"  [dim]... and {len(orphan_paths) - limit} more[/]")
 
 
 @app.command()
