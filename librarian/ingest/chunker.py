@@ -32,9 +32,14 @@ def parse_note(path: Path) -> tuple[dict, str, list[Chunk]]:
     Frontmatter is not included in any chunk's text.
     """
     raw = path.read_text(encoding="utf-8")
-    post = frontmatter.loads(raw)
-    fm = dict(post.metadata)
-    body = post.content
+    try:
+        post = frontmatter.loads(raw)
+        fm = dict(post.metadata)
+        body = post.content
+    except Exception:  # noqa: BLE001 — malformed YAML frontmatter is common in real vaults
+        # Don't lose the note: index it with no frontmatter and the raw text as body.
+        fm = {}
+        body = raw
 
     chunks = _split_by_headings(body, str(path))
     if not chunks:

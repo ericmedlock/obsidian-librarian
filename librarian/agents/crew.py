@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from crewai import Agent, Crew, LLM, Task
 
+from librarian.agents.tools import build_vault_tools
 from librarian.config import Config
+from librarian.rules.loader import RulesRegistry
 
 
 def _llm(cfg: Config) -> LLM:
@@ -11,11 +13,23 @@ def _llm(cfg: Config) -> LLM:
         base_url=cfg.lm_studio_url,
         api_key="not-needed",
         temperature=0.1,
+        # qwen3.6-27b is a reasoning model. Left on, it spends its whole token
+        # budget on hidden reasoning and returns empty `content`
+        # (finish_reason=length) → CrewAI's "Invalid response from LLM call -
+        # None or empty", and otherwise parrots the ReAct template placeholder.
+        # `reasoning_effort="none"` disables thinking on this LM Studio build
+        # (verified: reasoning_content length 0, direct well-formed answers).
+        reasoning_effort="none",
+        max_tokens=4000,
     )
 
 
-def build_crew(cfg: Config, inputs: dict) -> Crew:
+def build_crew(cfg: Config, inputs: dict, registry: RulesRegistry | None = None) -> Crew:
     llm = _llm(cfg)
+
+    if registry is None:
+        registry = RulesRegistry(cfg.rules_registry_path)
+    tools = build_vault_tools(cfg, registry)
 
     scanner = Agent(
         role="Obsidian Vault Inspector",
@@ -33,7 +47,8 @@ def build_crew(cfg: Config, inputs: dict) -> Crew:
             "checks before reaching for reasoning, and you never modify files, only observe and report."
         ),
         llm=llm,
-        verbose=False,
+        tools=tools,
+        verbose=True,
     )
 
     classifier = Agent(
@@ -51,7 +66,8 @@ def build_crew(cfg: Config, inputs: dict) -> Crew:
             "before inventing new ones."
         ),
         llm=llm,
-        verbose=False,
+        tools=[t for t in tools if t.name in ("read_note", "list_notes_missing_frontmatter")],
+        verbose=True,
     )
 
     rule_writer = Agent(
@@ -214,5 +230,5 @@ def build_crew(cfg: Config, inputs: dict) -> Crew:
     return Crew(
         agents=[scanner, classifier, rule_writer, organizer, reporter],
         tasks=[scan_task, classify_task, organize_task, rule_gen_task, report_task],
-        verbose=False,
+        verbose=True,
     )

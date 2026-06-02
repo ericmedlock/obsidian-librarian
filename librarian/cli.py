@@ -61,7 +61,7 @@ def run(dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no 
     console.print(f"[bold]Obsidian Librarian[/] — {mode}")
     console.print(f"Vault: {cfg.vault_path}\n")
 
-    crew = build_crew(cfg, inputs)
+    crew = build_crew(cfg, inputs, registry=registry)
     result = crew.kickoff(inputs=inputs)
     console.print(result)
 
@@ -131,6 +131,9 @@ def ingest(path: Path = typer.Argument(..., help="Path to a .md file to force-in
 @app.command()
 def scan(
     limit: Optional[int] = typer.Option(None, help="Only ingest the first N notes (for testing)"),
+    no_embed: bool = typer.Option(
+        False, "--no-embed", help="Graph metadata only — skip embeddings (fast)"
+    ),
 ):
     """Full vault scan: ingest every note into the vector store + metadata graph."""
     cfg = _get_cfg()
@@ -138,14 +141,18 @@ def scan(
     if limit:
         notes = notes[:limit]
 
-    console.print(f"Scanning [bold]{len(notes)}[/] notes from {cfg.vault_path}\n")
+    how = "metadata only" if no_embed else "embed + metadata"
+    console.print(f"Scanning [bold]{len(notes)}[/] notes from {cfg.vault_path} ({how})\n")
     pipeline = IngestPipeline(cfg)
 
     total_chunks = 0
     failed: list[tuple[str, str]] = []
-    for note in track(notes, description="Ingesting", console=console):
+    for note in track(notes, description="Scanning", console=console):
         try:
-            total_chunks += pipeline.ingest_file(note)
+            if no_embed:
+                pipeline.index_metadata_only(note)
+            else:
+                total_chunks += pipeline.ingest_file(note)
         except Exception as exc:  # noqa: BLE001 — report and continue the scan
             failed.append((note.name, str(exc)))
 
@@ -199,6 +206,117 @@ def watch():
     finally:
         watcher.stop()
         pipeline.close()
+
+
+@app.command()
+def audit(
+    write: bool = typer.Option(False, "--write", help="Write a Markdown report into the vault"),
+    rule_limit: int = typer.Option(0, help="Limit rule scan to first N notes (0 = all)"),
+):
+    """
+    Deterministic, rule-first dry-run audit — no LLM. Runs the rule registry
+    across the vault and reports actionable findings from the metadata graph
+    (orphans, missing frontmatter, stale notes). Fast and reliable; this is the
+    token-free layer the LLM agents escalate from.
+    """
+    import time
+
+    from librarian.pipeline import IngestPipeline
+    from librarian.rules.engine import FileEvent, RuleEngine
+
+    cfg = _get_cfg()
+    registry = _get_registry(cfg)
+    engine = RuleEngine(registry)
+    graph = VaultGraph(cfg)
+
+    notes = iter_vault_notes(cfg.vault_path)
+    scan = notes[:rule_limit] if rule_limit else notes
+
+    # 1. Rule-engine pass (token-free).
+    from collections import Counter
+
+    from librarian.ingest.chunker import parse_note
+
+    action_counts: Counter = Counter()
+    rule_hits: list[tuple[str, str, str]] = []
+    for note in track(scan, description="Running rules", console=console):
+        try:
+            fm, body, _ = parse_note(note)
+        except Exception:  # noqa: BLE001
+            continue
+        match = engine.run(FileEvent(path=note, frontmatter=fm, body=body))
+        if match:
+            action_counts[match.action] += 1
+            rule_hits.append((note.name, match.rule.id, match.action))
+
+    # 2. Graph-derived findings.
+    stats = graph.stats()
+    orphan_paths = graph.orphans()
+    missing_fm = [
+        r[0]
+        for r in graph._conn.execute(
+            "SELECT file_path FROM notes WHERE note_type='' OR status='' LIMIT 100000"
+        ).fetchall()
+    ]
+    cutoff = time.time() - cfg.stale_threshold_days * 86400
+    stale_orphans = [
+        r[0]
+        for r in graph._conn.execute(
+            "SELECT n.file_path FROM notes n WHERE n.modified_at IS NOT NULL "
+            "AND n.modified_at < ? AND NOT EXISTS "
+            "(SELECT 1 FROM links l WHERE l.target_name = _stem(n.file_path))",
+            (cutoff,),
+        ).fetchall()
+    ]
+    graph.close()
+
+    # 3. Report.
+    console.print("\n[bold]Obsidian Librarian — Audit (dry run, no writes)[/]\n")
+    summary = Table(show_header=False, box=None, padding=(0, 2))
+    summary.add_column("k", style="dim")
+    summary.add_column("v")
+    summary.add_row("Notes in graph", str(stats["total_notes"]))
+    summary.add_row("Wikilinks", str(stats["total_links"]))
+    summary.add_row("Rule hits", f"{len(rule_hits)} (scanned {len(scan)})")
+    summary.add_row("Orphans (no in/out links)", str(len(orphan_paths)))
+    summary.add_row("Missing frontmatter", str(len(missing_fm)))
+    summary.add_row(f"Stale (> {cfg.stale_threshold_days}d, no inbound)", str(len(stale_orphans)))
+    console.print(summary)
+
+    if action_counts:
+        console.print("\n[bold]Proposed rule actions[/]")
+        at = Table(show_header=True, box=None, padding=(0, 2))
+        at.add_column("Action", style="cyan")
+        at.add_column("Count", justify="right")
+        for action, n in action_counts.most_common():
+            at.add_row(action, str(n))
+        console.print(at)
+        for name, rid, action in rule_hits[:15]:
+            console.print(f"  [dim]{rid}[/] {action} → {name}")
+        if len(rule_hits) > 15:
+            console.print(f"  [dim]... and {len(rule_hits) - 15} more[/]")
+    else:
+        console.print("\n[dim]No rule hits — every scanned note would escalate to the LLM agents.[/]")
+
+    if write:
+        report_dir = Path(cfg.vault_path) / "Obsidian Librarian" / "Reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"{date.today().isoformat()}-audit.md"
+        lines = [
+            f"# Vault Audit — {date.today().isoformat()}",
+            "",
+            f"- Notes: {stats['total_notes']}",
+            f"- Wikilinks: {stats['total_links']}",
+            f"- Rule hits: {len(rule_hits)}",
+            f"- Orphans: {len(orphan_paths)}",
+            f"- Missing frontmatter: {len(missing_fm)}",
+            f"- Stale (> {cfg.stale_threshold_days}d, no inbound): {len(stale_orphans)}",
+            "",
+            "## Proposed rule actions",
+            *[f"- `{rid}` **{action}** → {name}" for name, rid, action in rule_hits],
+        ]
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"\n[green]Report written:[/] {report_path}")
 
 
 @app.command()

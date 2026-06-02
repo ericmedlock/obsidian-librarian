@@ -41,6 +41,18 @@ class IngestPipeline:
         self.graph.upsert_note(path, fm, body)
         return len(embedded)
 
+    def index_metadata_only(self, path: Path) -> bool:
+        """
+        Record a note's metadata + wikilinks in the graph WITHOUT embedding.
+        Fast enough to scan the whole vault in seconds — used to populate the
+        graph for rule/agent passes that don't need vector search.
+        """
+        if not path.exists():
+            return False
+        fm, body, _chunks = parse_note(path)
+        self.graph.upsert_note(path, fm, body)
+        return True
+
     def delete_file(self, path: Path) -> None:
         """Remove a file's chunks from the vector store and metadata graph."""
         file_path = str(path)
