@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from crewai import Agent, Crew, LLM, Task
 
+from librarian.agents.actions import build_write_tools
 from librarian.agents.tools import build_vault_tools
 from librarian.config import Config
 from librarian.rules.loader import RulesRegistry
@@ -30,6 +31,11 @@ def build_crew(cfg: Config, inputs: dict, registry: RulesRegistry | None = None)
     if registry is None:
         registry = RulesRegistry(cfg.rules_registry_path)
     tools = build_vault_tools(cfg, registry)
+
+    # Write tools are gated on dry_run; default to the SAFE dry-run if unset.
+    dry_run = bool(inputs.get("dry_run", True))
+    write_tools = build_write_tools(cfg, dry_run)
+    read_note_tool = [t for t in tools if t.name == "read_note"]
 
     scanner = Agent(
         role="Obsidian Vault Inspector",
@@ -101,7 +107,8 @@ def build_crew(cfg: Config, inputs: dict, registry: RulesRegistry | None = None)
             "irreplaceable second brain."
         ),
         llm=llm,
-        verbose=False,
+        tools=write_tools[:3] + read_note_tool,  # move_note, archive_note, write_frontmatter, read_note
+        verbose=True,
     )
 
     reporter = Agent(
@@ -117,7 +124,8 @@ def build_crew(cfg: Config, inputs: dict, registry: RulesRegistry | None = None)
             "Your reports are skimmable, honest, and actionable."
         ),
         llm=llm,
-        verbose=False,
+        tools=[t for t in write_tools if t.name == "write_report"],
+        verbose=True,
     )
 
     scan_task = Task(

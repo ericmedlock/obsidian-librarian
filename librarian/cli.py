@@ -39,10 +39,26 @@ def _get_registry(cfg):
 
 
 @app.command()
-def run(dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no writes")):
+def run(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no writes"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the autonomous-mode confirmation"),
+):
     """Full organization pass: scan → classify → organize → report."""
     cfg = _get_cfg()
     registry = _get_registry(cfg)
+
+    # Autonomous (non-dry) runs mutate the real vault. Require explicit
+    # confirmation unless --yes is passed. Files are only moved (never deleted),
+    # and every action is logged to run_log.jsonl.
+    if not dry_run and not yes:
+        console.print(
+            "[bold yellow]Autonomous mode[/] will MOVE files and WRITE frontmatter "
+            f"in:\n  {cfg.vault_path}\n[dim](move-only, never deletes; logged to "
+            f"{cfg.run_log_path})[/]"
+        )
+        if not typer.confirm("Proceed with real changes?"):
+            console.print("Aborted. (Use [cyan]--dry-run[/] to preview.)")
+            raise typer.Exit(0)
 
     from librarian.agents.crew import build_crew
     from datetime import datetime
