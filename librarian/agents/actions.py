@@ -22,8 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import frontmatter
-from crewai.tools import tool
 
+from crewai.tools import tool
 from librarian.config import Config
 
 _DAILY_RE = ("daily",)  # substrings that mark a daily note (never renamed)
@@ -35,7 +35,13 @@ def _now() -> str:
 
 def build_write_tools(cfg: Config, dry_run: bool) -> list:
     """Return the mutating tool set, gated on `dry_run` and confined to the vault."""
-    vault = Path(cfg.vault_path).resolve()
+    # `vault` (raw cfg path) is used to BUILD/STORE paths so they match how the
+    # rest of the system records them (iter_vault_notes uses cfg.vault_path
+    # directly). `vault_real` (symlink-resolved) is used only for the
+    # containment safety check, so /tmp→/private/tmp style symlinks can't be
+    # used to escape the vault.
+    vault = Path(cfg.vault_path)
+    vault_real = vault.resolve()
     log_path = cfg.run_log_path
 
     def _inside_vault(p: Path) -> bool:
@@ -43,13 +49,66 @@ def build_write_tools(cfg: Config, dry_run: bool) -> list:
             p = p.resolve()
         except OSError:
             return False
-        return p == vault or vault in p.parents
+        return p == vault_real or vault_real in p.parents
 
     def _log(action: str, **fields) -> None:
         entry = {"timestamp": _now(), "action": action, "dry_run": dry_run, **fields}
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+
+    def _graph_upsert(path: Path) -> None:
+        """Refresh a note's row + links in the metadata graph."""
+        from librarian.ingest.chunker import parse_note
+        from librarian.rag.graph import VaultGraph
+
+        g = VaultGraph(cfg)
+        try:
+            fm, body, _ = parse_note(path)
+            g.upsert_note(path, fm, body)
+        finally:
+            g.close()
+
+    def _graph_delete(path: Path) -> None:
+        from librarian.rag.graph import VaultGraph
+
+        g = VaultGraph(cfg)
+        try:
+            g.delete_note(str(path))
+        finally:
+            g.close()
+
+    def _store_delete(path: Path) -> None:
+        """Drop stale vector chunks for a moved/gone path (best-effort; the note
+        is re-embedded at its new path on the next scan/watch)."""
+        try:
+            from librarian.rag.store import VaultStore
+
+            VaultStore(cfg).delete(str(path))
+        except Exception:  # noqa: BLE001 — vector store is non-critical to organizing
+            pass
+
+    def _sync_move(old: Path, new: Path) -> None:
+        """Keep the graph + vector store consistent after a real move."""
+        _graph_delete(old)
+        _store_delete(old)
+        if new.exists():
+            _graph_upsert(new)
+
+    def _breaking_links(src: Path) -> list:
+        """Path-based inbound wikilinks that this move would break (name-based
+        links survive). Best-effort: a graph hiccup never blocks the move."""
+        try:
+            from librarian import safety
+            from librarian.rag.graph import VaultGraph
+
+            g = VaultGraph(cfg)
+            try:
+                return safety.breaking_inbound_links(g.all_links(), vault, src)
+            finally:
+                g.close()
+        except Exception:  # noqa: BLE001
+            return []
 
     def _move(src: Path, dest_dir: Path, action: str) -> str:
         if not _inside_vault(src) or not src.exists():
@@ -59,6 +118,13 @@ def build_write_tools(cfg: Config, dry_run: bool) -> list:
         dest = dest_dir / src.name
         if dest.resolve() == src.resolve():
             return f"SKIPPED: already in place: {src.name}"
+        breakers = _breaking_links(src)
+        if breakers:
+            srcs = ", ".join(sorted({Path(s).name for s, _ in breakers})[:5])
+            return (
+                f"REFUSED: moving {src.name} would break {len(breakers)} path-based "
+                f"wikilink(s) from: {srcs}. Update those links first, or leave it in place."
+            )
         _log(action, src=str(src), dest=str(dest))
         if dry_run:
             return f"DRY RUN: would move {src.name} → {dest_dir.relative_to(vault)}/"
@@ -66,6 +132,7 @@ def build_write_tools(cfg: Config, dry_run: bool) -> list:
         if dest.exists():
             return f"REFUSED: destination already exists (won't overwrite): {dest}"
         shutil.move(str(src), str(dest))
+        _sync_move(src, dest)
         return f"MOVED {src.name} → {dest_dir.relative_to(vault)}/"
 
     @tool("move_note")
@@ -105,6 +172,7 @@ def build_write_tools(cfg: Config, dry_run: bool) -> list:
             return f"DRY RUN: would add {list(added)} to {p.name}"
         post.metadata.update(added)
         p.write_text(frontmatter.dumps(post), encoding="utf-8")
+        _graph_upsert(p)  # refresh note_type/status/privacy_tier etc. in the graph
         return f"WROTE frontmatter {list(added)} → {p.name}"
 
     @tool("write_report")

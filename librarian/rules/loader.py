@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from ruamel.yaml import YAML
-from watchdog.events import FileSystemEventHandler, FileModifiedEvent
+from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 _yaml = YAML()
@@ -108,5 +110,14 @@ class RulesRegistry:
             for rule in self._rules:
                 if raw["id"] == rule.id:
                     raw["hit_count"] = rule.hit_count
-        with open(self._path, "w") as f:
-            _yaml.dump(data, f)
+        # Atomic write: dump to a temp file in the same dir, then os.replace so a
+        # crash or a concurrent reader never sees a half-written registry.
+        fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                _yaml.dump(data, f)
+            os.replace(tmp, self._path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise

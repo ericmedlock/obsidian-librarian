@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 
 from crewai.tools import tool
-
 from librarian.config import Config
 from librarian.ingest.chunker import parse_note
 from librarian.pipeline import iter_vault_notes

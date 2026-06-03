@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from crewai import Agent, Crew, LLM, Task
-
+from crewai import LLM, Agent, Crew, Task
 from librarian.agents.actions import build_write_tools
 from librarian.agents.tools import build_vault_tools
 from librarian.config import Config

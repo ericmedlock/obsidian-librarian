@@ -67,7 +67,7 @@ class VaultStore:
         metas = results["metadatas"][0] if results["metadatas"] else []
         dists = results["distances"][0] if results["distances"] else []
 
-        for doc, meta, dist in zip(docs, metas, dists):
+        for doc, meta, dist in zip(docs, metas, dists, strict=False):
             hits.append({"text": doc, "metadata": meta, "distance": dist})
 
         return hits[:top_k]

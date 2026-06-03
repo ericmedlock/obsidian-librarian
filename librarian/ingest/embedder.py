@@ -55,7 +55,7 @@ class Embedder:
                 embedding=item.embedding,
                 default_privacy_tier=self._default_privacy_tier,
             )
-            for chunk, item in zip(chunks, response.data)
+            for chunk, item in zip(chunks, response.data, strict=False)
         ]
 
     def embed_query(self, text: str) -> list[float]:

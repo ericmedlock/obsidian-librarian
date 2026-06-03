@@ -50,6 +50,10 @@ class VaultGraph:
         self._conn = sqlite3.connect(str(cfg.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # WAL lets the watcher's writes not block reads (and vice versa); a
+        # busy_timeout makes brief lock contention retry instead of erroring.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         # Map a stored file_path to its wikilink-comparable stem ("/a/My Note.md" -> "My Note").
         self._conn.create_function("_stem", 1, lambda p: Path(p).stem, deterministic=True)
         self._conn.executescript(_SCHEMA)
@@ -125,6 +129,24 @@ class VaultGraph:
     def count(self) -> int:
         with self._lock:
             return self._conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+
+    def all_links(self) -> list[tuple[str, str]]:
+        """Every (source_path, target_name) wikilink edge in the vault."""
+        with self._lock:
+            return [
+                (r[0], r[1])
+                for r in self._conn.execute("SELECT source_path, target_name FROM links").fetchall()
+            ]
+
+    def prune_missing(self) -> list[str]:
+        """Delete graph rows whose underlying file no longer exists on disk.
+        Returns the removed file paths. Cleans up after out-of-band moves."""
+        with self._lock:
+            paths = [r[0] for r in self._conn.execute("SELECT file_path FROM notes").fetchall()]
+        gone = [p for p in paths if not Path(p).exists()]
+        for p in gone:
+            self.delete_note(p)
+        return gone
 
     def orphans(self) -> list[str]:
         """

@@ -9,6 +9,7 @@ description = "Locally-running AI vault organizer and RAG backend for Obsidian"
 requires-python = ">=3.12"
 dependencies = [
     "crewai>=0.80.0",
+    "litellm>=1.50.0",
     "chromadb>=0.5.0",
     "openai>=1.50.0",
     "watchdog>=4.0.0",
@@ -25,8 +26,34 @@ dependencies = [
     "tiktoken>=0.7.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 librarian = "librarian.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["librarian"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# Hermetic by default: tests must not require LM Studio, the network, or a real
+# vault. Anything that does is marked and excluded from the default/CI run.
+markers = [
+    "live: requires a running LM Studio / network (excluded from CI)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+# E501: line length handled by formatter. B008: Typer/FastAPI idiomatically call
+# Option()/Argument() in parameter defaults.
+ignore = ["E501", "B008"]

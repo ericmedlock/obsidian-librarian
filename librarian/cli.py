@@ -42,8 +42,13 @@ def _get_registry(cfg):
 def run(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no writes"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the autonomous-mode confirmation"),
+    force: bool = typer.Option(False, "--force", help="Allow autonomous run on a non-git vault"),
 ):
     """Full organization pass: scan → classify → organize → report."""
+    from pathlib import Path
+
+    from librarian import safety
+
     cfg = _get_cfg()
     registry = _get_registry(cfg)
 
@@ -60,8 +65,24 @@ def run(
             console.print("Aborted. (Use [cyan]--dry-run[/] to preview.)")
             raise typer.Exit(0)
 
+    # Safety net: snapshot the vault with git before mutating it, so the whole
+    # run is recoverable. Refuse on a non-git vault unless --force.
+    if not dry_run:
+        vault = Path(cfg.vault_path)
+        if safety.is_git_repo(vault):
+            sha = safety.snapshot(vault, "librarian: pre-run snapshot")
+            console.print(f"[dim]Vault snapshot:[/] {sha[:10]} (restore with git if needed)")
+        elif not force:
+            console.print(
+                "[red]Refusing autonomous run:[/] vault is not a git repo, so changes "
+                "wouldn't be recoverable.\nInitialize git in the vault, or re-run with "
+                "[cyan]--force[/] if you have another backup."
+            )
+            raise typer.Exit(1)
+        else:
+            console.print("[yellow]--force:[/] proceeding on a non-git vault (no snapshot).")
+
     from librarian.agents.crew import build_crew
-    from datetime import datetime
 
     inputs = {
         "vault_path": cfg.vault_path,
@@ -172,13 +193,20 @@ def scan(
         except Exception as exc:  # noqa: BLE001 — report and continue the scan
             failed.append((note.name, str(exc)))
 
+    # A full scan should leave the graph reflecting exactly what's on disk:
+    # drop rows for notes deleted/moved out of band. (Skip for partial scans.)
+    pruned = 0
+    if not limit:
+        pruned = len(pipeline.graph.prune_missing())
+
     stats = pipeline.graph.stats()
     pipeline.close()
 
     console.print(
         f"\n[green]Done.[/] {len(notes) - len(failed)} notes, "
-        f"{total_chunks} chunks indexed. "
-        f"Graph: {stats['total_notes']} notes, {stats['orphans']} orphans, "
+        f"{total_chunks} chunks indexed"
+        + (f", {pruned} stale rows pruned" if pruned else "")
+        + f". Graph: {stats['total_notes']} notes, {stats['orphans']} orphans, "
         f"{stats['total_links']} links."
     )
     if failed:
@@ -237,7 +265,6 @@ def audit(
     """
     import time
 
-    from librarian.pipeline import IngestPipeline
     from librarian.rules.engine import FileEvent, RuleEngine
 
     cfg = _get_cfg()
