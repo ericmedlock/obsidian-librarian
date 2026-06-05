@@ -27,15 +27,22 @@ class RuleEngine:
     def __init__(self, registry: RulesRegistry) -> None:
         self._registry = registry
 
-    def run(self, event: FileEvent) -> Optional[RuleMatch]:
+    def run(self, event: FileEvent, count_hit: bool = True) -> Optional[RuleMatch]:
         """
         Run all rules against a file event in registration order.
         Returns the first match, or None if no rule covers this case.
+
+        `count_hit` persists an incremented hit_count for the matched rule.
+        Read-only passes (audit, dry-run previews, the LLM's scan tool) pass
+        count_hit=False so merely *looking* at the vault doesn't mutate the
+        registry — hit_count should reflect rules that actually fired on a
+        real change, not scans.
         """
         filename = event.path.name
         for rule in self._registry.rules:
             if self._matches(rule, filename, event.frontmatter, event.body):
-                self._registry.increment_hit(rule.id)
+                if count_hit:
+                    self._registry.increment_hit(rule.id)
                 return RuleMatch(
                     rule=rule,
                     action=rule.action,

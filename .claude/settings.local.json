@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(librarian --help)",
+      "Bash(librarian rules *)",
+      "Bash(librarian status *)",
+      "Bash(python -c \"import frontmatter; print\\('ok'\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(pip show *)",
+      "Bash(pip --version)",
+      "Bash(pip3 --version)"
+    ]
+  }
+}

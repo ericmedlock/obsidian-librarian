@@ -90,7 +90,9 @@ def organize(
             fm, body, _ = parse_note(note)
         except Exception:  # noqa: BLE001 — skip unreadable notes
             continue
-        match = engine.run(FileEvent(path=note, frontmatter=fm, body=body))
+        # Count a hit only when this pass can actually apply it; a dry-run preview
+        # must not mutate the registry.
+        match = engine.run(FileEvent(path=note, frontmatter=fm, body=body), count_hit=not dry_run)
         if not match:
             continue
         plan = plan_for_match(match)

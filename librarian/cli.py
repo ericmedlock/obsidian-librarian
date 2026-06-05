@@ -39,12 +39,59 @@ def _get_registry(cfg):
 
 
 @app.command()
+def init(
+    vault: Optional[str] = typer.Option(None, "--vault", help="Path to your Obsidian vault"),
+):
+    """Create ~/.librarian/config.yaml pointing at your vault (first-time setup)."""
+    from ruamel.yaml import YAML
+
+    cfg_path = Path("~/.librarian/config.yaml").expanduser()
+    cfg = load_config()  # current effective config (defaults, or an existing file)
+
+    if cfg_path.exists() and not typer.confirm(f"Config exists at {cfg_path}. Overwrite?"):
+        raise typer.Exit(0)
+
+    vault_path = vault or typer.prompt("Path to your Obsidian vault", default=cfg.vault_path)
+    vault_path = str(Path(vault_path).expanduser())
+    vp = Path(vault_path)
+    if not vp.exists():
+        console.print(f"[yellow]Warning:[/] {vault_path} does not exist yet.")
+        if not typer.confirm("Use it anyway?"):
+            raise typer.Exit(0)
+    elif not (vp / ".git").exists():
+        console.print(
+            "[yellow]Note:[/] that vault is not a git repo. Autonomous `organize --apply` and "
+            "`run` will refuse without --force (no snapshot to restore from). Consider running "
+            "[cyan]git init[/] inside the vault."
+        )
+
+    lm_url = typer.prompt("LM Studio URL", default=cfg.lm_studio_url)
+    model = typer.prompt("Main model", default=cfg.main_model)
+
+    data = {"vault_path": vault_path, "lm_studio_url": lm_url, "main_model": model}
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w") as f:
+        YAML().dump(data, f)
+    console.print(f"[green]Wrote[/] {cfg_path}")
+    console.print(
+        "Next: [cyan]librarian scan[/], then [cyan]librarian organize[/] for a dry-run preview."
+    )
+
+
+@app.command()
 def run(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview only, no writes"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the autonomous-mode confirmation"),
     force: bool = typer.Option(False, "--force", help="Allow autonomous run on a non-git vault"),
 ):
-    """Full organization pass: scan → classify → organize → report."""
+    """
+    LLM-assisted organization pass: scan → classify → organize → report.
+
+    This is the reasoning-heavy path — it drives the CrewAI agents against your
+    local LM Studio model. For routine cleanup prefer the deterministic, no-LLM
+    `librarian organize`, which only auto-applies safe rule-based moves and
+    queues anything ambiguous for your approval.
+    """
     from pathlib import Path
 
     from librarian import safety
@@ -287,7 +334,7 @@ def audit(
             fm, body, _ = parse_note(note)
         except Exception:  # noqa: BLE001
             continue
-        match = engine.run(FileEvent(path=note, frontmatter=fm, body=body))
+        match = engine.run(FileEvent(path=note, frontmatter=fm, body=body), count_hit=False)
         if match:
             action_counts[match.action] += 1
             rule_hits.append((note.name, match.rule.id, match.action))
@@ -360,6 +407,181 @@ def audit(
         ]
         report_path.write_text("\n".join(lines), encoding="utf-8")
         console.print(f"\n[green]Report written:[/] {report_path}")
+
+
+def _snapshot_or_refuse(cfg, message: str, force: bool) -> bool:
+    """Git-snapshot the vault before mutating it. Returns False (and prints why)
+    if the vault isn't a git repo and --force wasn't given."""
+    from librarian import safety
+
+    vault = Path(cfg.vault_path)
+    if safety.is_git_repo(vault):
+        sha = safety.snapshot(vault, message)
+        console.print(f"[dim]Vault snapshot:[/] {sha[:10]} (restore with git if needed)")
+        return True
+    if force:
+        console.print("[yellow]--force:[/] proceeding on a non-git vault (no snapshot).")
+        return True
+    console.print(
+        "[red]Refusing to apply:[/] vault is not a git repo, so changes wouldn't be "
+        "recoverable.\nInitialize git in the vault, or re-run with [cyan]--force[/] if you "
+        "have another backup."
+    )
+    return False
+
+
+@app.command()
+def organize(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually apply changes (default is a safe dry-run preview)"
+    ),
+    limit: int = typer.Option(0, help="Only process the first N notes (0 = all)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the apply confirmation"),
+    force: bool = typer.Option(False, "--force", help="Allow applying on a non-git vault"),
+):
+    """
+    Deterministic, rule-based organization pass — NO LLM. Auto-applies safe,
+    reversible, link-guarded moves and queues anything risky for your approval
+    (see `librarian review`). Defaults to a dry-run preview; pass --apply to write.
+    """
+    from librarian.organizer import organize as run_organize
+    from librarian.pending import PendingActions
+
+    cfg = _get_cfg()
+    registry = _get_registry(cfg)
+    dry_run = not apply
+
+    if apply and not yes:
+        console.print(
+            "[bold yellow]Apply mode[/] will MOVE files in:\n"
+            f"  {cfg.vault_path}\n[dim](safe rule moves only — risky actions are queued, never "
+            f"auto-applied; move-only, never deletes; logged to {cfg.run_log_path})[/]"
+        )
+        if not typer.confirm("Proceed with real changes?"):
+            console.print("Aborted. (Omit [cyan]--apply[/] to preview.)")
+            raise typer.Exit(0)
+
+    if apply and not _snapshot_or_refuse(cfg, "librarian: pre-organize snapshot", force):
+        raise typer.Exit(1)
+
+    pending = PendingActions(cfg)
+    try:
+        summary = run_organize(cfg, registry, pending, dry_run=dry_run, limit=limit)
+    finally:
+        pending.close()
+
+    mode = "[yellow]DRY RUN[/]" if dry_run else "[green]APPLIED[/]"
+    console.print(f"\n[bold]Organize[/] — {mode}  (scanned {summary['scanned']})")
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column("k", style="dim")
+    t.add_column("v")
+    t.add_row("Auto-applied" + (" (preview)" if dry_run else ""), str(summary["auto_applied"]))
+    t.add_row("Queued for review" + (" (would queue)" if dry_run else ""), str(summary["queued"]))
+    t.add_row("Skipped / refused", str(summary["skipped"]))
+    console.print(t)
+
+    for d in summary["detail"][:15]:
+        if d.get("auto"):
+            console.print(f"  [cyan]auto[/] {d['note']}: {d['result']}")
+        else:
+            console.print(f"  [magenta]queue[/] {d['note']}: {d['action']} → {d['target']}")
+    if len(summary["detail"]) > 15:
+        console.print(f"  [dim]... and {len(summary['detail']) - 15} more[/]")
+
+    queued = summary["queued"]
+    if not dry_run and queued:
+        console.print(
+            f"\n[dim]{queued} action(s) need your approval — run[/] [cyan]librarian review[/]"
+        )
+
+
+@app.command()
+def review():
+    """List actions queued for your approval by `librarian organize`."""
+    from librarian.pending import PendingActions
+
+    cfg = _get_cfg()
+    pending = PendingActions(cfg)
+    items = pending.list()
+    pending.close()
+
+    if not items:
+        console.print("No pending actions. [dim]Run `librarian organize --apply` to generate some.[/]")
+        return
+
+    table = Table(title="Pending actions", show_header=True, box=None, padding=(0, 2))
+    table.add_column("ID", style="cyan", justify="right")
+    table.add_column("Action")
+    table.add_column("Note")
+    table.add_column("Target", style="dim")
+    table.add_column("Reason", style="dim")
+    for it in items:
+        table.add_row(
+            str(it["id"]),
+            it["action"],
+            Path(it["note_path"]).name,
+            it.get("target") or "",
+            it.get("reason") or "",
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]Apply one with[/] [cyan]librarian approve <id>[/][dim], "
+        "or dismiss with[/] [cyan]librarian reject <id>[/]"
+    )
+
+
+@app.command()
+def approve(
+    action_id: int = typer.Argument(..., help="Pending action id (see `librarian review`)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    force: bool = typer.Option(False, "--force", help="Allow applying on a non-git vault"),
+):
+    """Approve and apply a single queued action."""
+    from librarian.organizer import apply_pending
+    from librarian.pending import PendingActions
+
+    cfg = _get_cfg()
+    pending = PendingActions(cfg)
+    row = pending.get(action_id)
+    if row is None:
+        console.print(f"[red]No pending action #{action_id}.[/] Run `librarian review`.")
+        pending.close()
+        raise typer.Exit(1)
+
+    console.print(
+        f"#{action_id}: [bold]{row['action']}[/] → {Path(row['note_path']).name} "
+        f"[dim](target: {row['target']})[/]"
+    )
+    if not yes and not typer.confirm("Apply this action?"):
+        console.print("Aborted.")
+        pending.close()
+        raise typer.Exit(0)
+
+    if not _snapshot_or_refuse(cfg, f"librarian: pre-approve #{action_id}", force):
+        pending.close()
+        raise typer.Exit(1)
+
+    pending.approve(action_id)
+    result = apply_pending(cfg, pending, action_id)
+    pending.close()
+    console.print(result)
+
+
+@app.command()
+def reject(action_id: int = typer.Argument(..., help="Pending action id to dismiss")):
+    """Reject (dismiss) a queued action without applying it."""
+    from librarian.pending import PendingActions
+
+    cfg = _get_cfg()
+    pending = PendingActions(cfg)
+    row = pending.get(action_id)
+    if row is None:
+        console.print(f"[red]No pending action #{action_id}.[/]")
+        pending.close()
+        raise typer.Exit(1)
+    pending.reject(action_id)
+    pending.close()
+    console.print(f"Rejected #{action_id}: {row['action']} → {Path(row['note_path']).name}")
 
 
 @app.command()

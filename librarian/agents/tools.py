@@ -83,7 +83,7 @@ def build_vault_tools(cfg: Config, registry: RulesRegistry) -> list:
                 fm, body, _ = parse_note(note)
             except Exception:  # noqa: BLE001 — skip unreadable notes
                 continue
-            match = engine.run(FileEvent(path=note, frontmatter=fm, body=body))
+            match = engine.run(FileEvent(path=note, frontmatter=fm, body=body), count_hit=False)
             if match:
                 hits.append(
                     {"file": note.name, "rule_id": match.rule.id, "action": match.action}
